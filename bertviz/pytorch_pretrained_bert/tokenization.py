@@ -21,6 +21,8 @@ import logging
 import os
 import unicodedata
 from io import open
+import six
+import sentencepiece as sp
 
 from .file_utils import cached_path
 
@@ -46,16 +48,16 @@ PRETRAINED_VOCAB_POSITIONAL_EMBEDDINGS_SIZE_MAP = {
 }
 VOCAB_NAME = 'vocab.txt'
 
-
 def load_vocab(vocab_file):
     """Loads a vocabulary file into a dictionary."""
     vocab = collections.OrderedDict()
     index = 0
-    with open(vocab_file, "r", encoding="utf-8") as reader:
+    with open(vocab_file, "r", encoding="utf-8")  as reader:
         while True:
-            token = reader.readline()
+            token = convert_to_unicode(reader.readline())
             if not token:
                 break
+            token, _ = token.split("\t")
             token = token.strip()
             vocab[token] = index
             index += 1
@@ -74,46 +76,35 @@ def whitespace_tokenize(text):
 class BertTokenizer(object):
     """Runs end-to-end tokenization: punctuation splitting + wordpiece"""
 
-    def __init__(self, vocab_file, do_lower_case=True, max_len=None,
+    def __init__(self, model_file, vocab_file, do_lower_case=True, max_len=None,
                  never_split=("[UNK]", "[SEP]", "[PAD]", "[CLS]", "[MASK]")):
         if not os.path.isfile(vocab_file):
             raise ValueError(
                 "Can't find a vocabulary file at path '{}'. To load the vocabulary from a Google pretrained "
                 "model use `tokenizer = BertTokenizer.from_pretrained(PRETRAINED_MODEL_NAME)`".format(vocab_file))
-        self.vocab = load_vocab(vocab_file)
+        # self.vocab_file = load_vocab(vocab_file)
+        self.vocab_file = vocab_file
+        self.vocab = load_vocab(self.vocab_file)
+        self.model_file = model_file
         self.ids_to_tokens = collections.OrderedDict(
             [(ids, tok) for tok, ids in self.vocab.items()])
-        self.basic_tokenizer = BasicTokenizer(do_lower_case=do_lower_case,
-                                              never_split=never_split)
-        self.wordpiece_tokenizer = WordpieceTokenizer(vocab=self.vocab)
+        self.full_tokenizer = FullTokenizer(model_file=self.model_file, vocab_file=self.vocab_file)
         self.max_len = max_len if max_len is not None else int(1e12)
 
     def tokenize(self, text):
         split_tokens = []
-        for token in self.basic_tokenizer.tokenize(text):
-            for sub_token in self.wordpiece_tokenizer.tokenize(token):
-                split_tokens.append(sub_token)
+        for sub_token in self.full_tokenizer.tokenize(text):
+            split_tokens.append(sub_token)
         return split_tokens
 
     def convert_tokens_to_ids(self, tokens):
-        """Converts a sequence of tokens into ids using the vocab."""
-        ids = []
-        for token in tokens:
-            ids.append(self.vocab[token])
-        if len(ids) > self.max_len:
-            raise ValueError(
-                "Token indices sequence length is longer than the specified maximum "
-                " sequence length for this BERT model ({} > {}). Running this"
-                " sequence through BERT will result in indexing errors".format(len(ids), self.max_len)
-            )
-        return ids
+        """Id of <unk> is assumed as 0 accroding to sentencepiece"""
+        return convert_by_vocab(self.vocab, tokens, unk_info=0)
 
     def convert_ids_to_tokens(self, ids):
-        """Converts a sequence of ids in wordpiece tokens using the vocab."""
-        tokens = []
-        for i in ids:
-            tokens.append(self.ids_to_tokens[i])
-        return tokens
+        """Token of unknown word is assumed as <unk> according to sentencepiece"""
+        return convert_by_vocab(self.inv_vocab, ids, unk_info="<unk>")
+        
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, cache_dir=None, *inputs, **kwargs):
@@ -121,11 +112,13 @@ class BertTokenizer(object):
         Instantiate a PreTrainedBertModel from a pre-trained model file.
         Download and cache the pre-trained model file if needed.
         """
+        model_file = os.path.join(pretrained_model_name_or_path, "wiki-ja.model")
         if pretrained_model_name_or_path in PRETRAINED_VOCAB_ARCHIVE_MAP:
             vocab_file = PRETRAINED_VOCAB_ARCHIVE_MAP[pretrained_model_name_or_path]
         else:
             vocab_file = pretrained_model_name_or_path
         if os.path.isdir(vocab_file):
+            VOCAB_NAME = "wiki-ja.vocab"
             vocab_file = os.path.join(vocab_file, VOCAB_NAME)
         # redirect to the cache, if necessary
         try:
@@ -150,7 +143,7 @@ class BertTokenizer(object):
             max_len = PRETRAINED_VOCAB_POSITIONAL_EMBEDDINGS_SIZE_MAP[pretrained_model_name_or_path]
             kwargs['max_len'] = min(kwargs.get('max_len', int(1e12)), max_len)
         # Instantiate tokenizer.
-        tokenizer = cls(resolved_vocab_file, *inputs, **kwargs)
+        tokenizer = cls(model_file, resolved_vocab_file, *inputs, **kwargs)
         return tokenizer
 
 
@@ -369,3 +362,74 @@ def _is_punctuation(char):
     if cat.startswith("P"):
         return True
     return False
+
+def convert_by_vocab(vocab, items, unk_info):
+    """Converts a sequence of [tokens|ids] using the vocab."""
+    output = []
+    for item in items:
+        if item in vocab:
+            output.append(vocab[item])
+        else:
+            output.append(unk_info)
+    return output
+
+def convert_to_unicode(text):
+    """Converts `text` to Unicode (if it's not already), assuming utf-8 input."""
+    if six.PY3:
+        if isinstance(text, str):
+            return text
+        elif isinstance(text, bytes):
+            return text.decode("utf-8", "ignore")
+        else:
+            raise ValueError("Unsupported string type: %s" % (type(text)))
+    elif six.PY2:
+        if isinstance(text, str):
+            return text.decode("utf-8", "ignore")
+        elif isinstance(text, unicode):
+            return text
+        else:
+            raise ValueError("Unsupported string type: %s" % (type(text)))
+    else:
+        raise ValueError("Not running on Python2 or Python 3?")
+
+
+class SentencePieceTokenizer(object):
+    """Runs SentencePiece tokenization (from raw text to tokens list)"""
+
+    def __init__(self, model_file=None, do_lower_case=True):
+        """Constructs a SentencePieceTokenizer."""
+        self.tokenizer = sp.SentencePieceProcessor()
+        if self.tokenizer.Load(model_file):
+            print("Loaded a trained SentencePiece model.")
+        else:
+            print("You have to give a path of trained SentencePiece model.")
+            sys.exit(1)
+        self.do_lower_case = do_lower_case
+
+    def tokenize(self, text):
+        """Tokenizes a piece of text."""
+        text = convert_to_unicode(text)
+        if self.do_lower_case:
+            text = text.lower()
+        output_tokens = self.tokenizer.EncodeAsPieces(text)
+        return output_tokens
+
+class FullTokenizer(object):
+    """Runs end-to-end tokenziation."""
+
+    def __init__(self, model_file, vocab_file, do_lower_case=True):
+        self.tokenizer = SentencePieceTokenizer(model_file, do_lower_case=do_lower_case)
+        self.vocab = load_vocab(vocab_file)
+        self.inv_vocab = {v: k for k, v in self.vocab.items()}
+
+    def tokenize(self, text):
+        split_tokens = self.tokenizer.tokenize(text)
+        return split_tokens
+
+    def convert_tokens_to_ids(self, tokens):
+        """Id of <unk> is assumed as 0 accroding to sentencepiece"""
+        return convert_by_vocab(self.vocab, tokens, unk_info=0)
+
+    def convert_ids_to_tokens(self, ids):
+        """Token of unknown word is assumed as <unk> according to sentencepiece"""
+        return convert_by_vocab(self.inv_vocab, ids, unk_info="<unk>")
